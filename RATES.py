@@ -254,6 +254,7 @@ REQUIRED_PVT_COLS = ["FIELD", "PO", "RS", "BO", "PG", "RV", "BG", "PW", "BW"]
 
 P_MAX_BAR = 400.0
 RATE_COLS = ["WOPR", "WGPR", "WWPR", "WGIR", "WWIR"]
+DEFAULT_BHP_TUNED = 300.0
 
 
 def _read_table(path: str) -> pd.DataFrame:
@@ -370,6 +371,7 @@ def compute_equivalent_water_rate(
 
     # Convert numeric columns
     data = _to_numeric(data, ["BHP_bar_tuned"] + RATE_COLS)
+    data["BHP_bar_tuned"] = data["BHP_bar_tuned"].fillna(DEFAULT_BHP_TUNED)
 
     # KEY FIX: Treat missing production/injection rates as zero
     data[RATE_COLS] = data[RATE_COLS].fillna(0.0)

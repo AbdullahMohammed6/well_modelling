@@ -13,6 +13,11 @@ PA_PER_PSI = 6894.757293168
 P_STD_PA = 101325.0
 T_STD_K = 288.15
 R = 8.314462618
+ACTIVITY_COLS = ["WOPR", "WWPR", "WGPR", "WWIR", "WGIR"]
+DEFAULT_BHP_BAR = 100.0
+DEFAULT_THP_BAR = 100.0
+THP_SMOOTH_WINDOW = 3
+BHP_SMOOTH_WINDOW = 5
 
 
 def _head_list(x: Iterable, n: int = 10):
@@ -404,6 +409,66 @@ def _get_rate(series: pd.Series, key: str) -> float:
     except Exception:
         return 0.0
     return v if np.isfinite(v) else 0.0
+
+
+def _activity_mask(df: pd.DataFrame) -> pd.Series:
+    cols = [c for c in ACTIVITY_COLS if c in df.columns]
+    if not cols:
+        return pd.Series(False, index=df.index)
+    return (
+        df[cols]
+        .apply(pd.to_numeric, errors="coerce")
+        .fillna(0.0)
+        .ne(0.0)
+        .any(axis=1)
+    )
+
+
+def _smooth_series_time(
+    dates: pd.Series,
+    values: pd.Series,
+    window: int,
+) -> pd.Series:
+    series = pd.Series(values.to_numpy(), index=dates)
+    series = series.interpolate(method="time", limit_direction="both")
+    series = series.rolling(window=window, min_periods=1, center=True).mean()
+    return pd.Series(series.to_numpy(), index=values.index)
+
+
+def _smooth_thp_for_well(df_well: pd.DataFrame) -> pd.DataFrame:
+    df_well = df_well.sort_values("DATE").copy()
+    activity = _activity_mask(df_well)
+    thp = pd.to_numeric(df_well["WTHPS"], errors="coerce")
+    if activity.any():
+        active_thp = thp.where(activity)
+        if active_thp.notna().any():
+            smoothed = _smooth_series_time(df_well["DATE"], active_thp, THP_SMOOTH_WINDOW)
+            thp = thp.where(~activity, smoothed)
+        else:
+            thp = thp.where(~activity, DEFAULT_THP_BAR)
+    df_well["WTHPS"] = thp
+    return df_well
+
+
+def _smooth_bhp_for_well(df_well: pd.DataFrame) -> pd.DataFrame:
+    df_well = df_well.sort_values("DATE").copy()
+    activity = _activity_mask(df_well)
+    bhp = pd.to_numeric(df_well["BHP_bar"], errors="coerce")
+    bhp_raw = bhp.copy()
+    filled_mask = pd.Series(False, index=df_well.index)
+    if activity.any():
+        active_bhp = bhp.where(activity)
+        if active_bhp.notna().any():
+            smoothed = _smooth_series_time(df_well["DATE"], active_bhp, BHP_SMOOTH_WINDOW)
+            bhp = bhp.where(~activity, smoothed)
+            filled_mask = activity & bhp_raw.isna() & bhp.notna()
+        else:
+            bhp = bhp.where(~activity, DEFAULT_BHP_BAR)
+            filled_mask = activity & bhp_raw.isna()
+    df_well["BHP_bar"] = bhp
+    if "BHP_STATUS" in df_well.columns:
+        df_well["BHP_STATUS"] = df_well["BHP_STATUS"].where(~filled_mask, "DEFAULTED")
+    return df_well
 
 
 def _get_thp_bar(row: pd.Series) -> float:
@@ -809,6 +874,11 @@ def main(processes: int | None = None):
     report_mapping_coverage(completion, "COMPLETION", "WELLBORE_ID")
 
     prod_m = prod.dropna(subset=["WELL_KEY"]).copy()
+    prod_m = (
+        prod_m.groupby("WELL_KEY", group_keys=False)
+        .apply(_smooth_thp_for_well)
+        .reset_index(drop=True)
+    )
     traj_m = traj.dropna(subset=["WELL_KEY"]).copy()
     top_perf_m = top_perf.dropna(subset=["WELL_KEY"]).copy()
     completion_m = completion.dropna(subset=["WELL_KEY"]).copy()
@@ -881,6 +951,12 @@ def main(processes: int | None = None):
 
     segments = pd.concat(segments_list, ignore_index=True)
     prod_calc = pd.concat(prod_results, ignore_index=True) if prod_results else pd.DataFrame(columns=list(prod_m.columns) + ["BHP_bar", "BHP_STATUS"])
+    if not prod_calc.empty:
+        prod_calc = (
+            prod_calc.groupby("WELL_KEY", group_keys=False)
+            .apply(_smooth_bhp_for_well)
+            .reset_index(drop=True)
+        )
 
     prod_out = prod.copy()
     prod_out = prod_out.merge(
