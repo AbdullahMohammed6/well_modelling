@@ -9,6 +9,7 @@ DEFAULT_INPUT = "../input/well_modelling/prod_with_bhp.csv"
 DEFAULT_OUTPUT = "../input/well_modelling/prod_with_bhp_tuned.csv"
 CALC_COLUMN = "BHP_bar"
 ACTIVITY_COLS = ["WOPR", "WWPR", "WGPR", "WWIR", "WGIR"]
+DEFAULT_TUNED_BHP = 300.0
 
 
 def _head_list(x: Iterable, n: int = 5) -> list:
@@ -100,6 +101,7 @@ def tune_well(df_well: pd.DataFrame, measured_col: str, calc_col: str = CALC_COL
             .clip(lower=100, upper=450)
         )
         tuned = tuned.where(~activity, continuous)
+        tuned = tuned.where(~activity, tuned.fillna(DEFAULT_TUNED_BHP))
     return tuned
 
 
