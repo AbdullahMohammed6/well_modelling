@@ -64,6 +64,48 @@ def alias_first_available(df: pd.DataFrame, target: str, candidates: list[str]) 
     return None
 
 
+def find_prod_diff_wells(prod: pd.DataFrame, prod_existing: pd.DataFrame | None) -> set[str]:
+    if prod_existing is None or prod_existing.empty:
+        return set(prod["WELL_KEY"].dropna().unique())
+
+    prod_existing = prod_existing.copy()
+    if "DATE" in prod_existing.columns:
+        prod_existing["DATE"] = pd.to_datetime(prod_existing["DATE"], errors="coerce")
+
+    keys = ["WELL", "DATE"]
+    if "WELL_KEY" in prod.columns and "WELL_KEY" in prod_existing.columns:
+        keys.append("WELL_KEY")
+
+    compare_cols = [
+        col
+        for col in prod.columns
+        if col in prod_existing.columns and col not in keys
+    ]
+
+    existing_subset = prod_existing[keys + compare_cols].copy()
+    merged = prod.merge(
+        existing_subset,
+        on=keys,
+        how="left",
+        suffixes=("", "_prev"),
+        indicator=True,
+    )
+
+    new_mask = merged["_merge"].eq("left_only")
+    changed_mask = pd.Series(False, index=merged.index)
+    for col in compare_cols:
+        prev_col = f"{col}_prev"
+        if prev_col not in merged.columns:
+            continue
+        same = merged[col].eq(merged[prev_col]) | (
+            merged[col].isna() & merged[prev_col].isna()
+        )
+        changed_mask |= ~same
+
+    diff = merged[new_mask | changed_mask]
+    return set(diff["WELL_KEY"].dropna().unique())
+
+
 def build_tubing_intervals_for_well(comp_w: pd.DataFrame, md_limit: float) -> pd.DataFrame:
     if comp_w.empty:
         return pd.DataFrame(columns=["md_top", "md_bot", "tubing_id", "ID_m"])
@@ -811,6 +853,14 @@ def main(processes: int | None = None):
     prod       = pd.read_csv("../input/well_modelling/pypdm_history.csv",       low_memory=False)
     traj       = pd.read_csv("../input/well_modelling/traj.csv",       low_memory=False)
     wellmap    = pd.read_csv("../input/well_modelling/WELLS.names",    low_memory=False)
+    try:
+        prod_existing = pd.read_csv("../input/well_modelling/prod_with_bhp.csv", low_memory=False)
+    except FileNotFoundError:
+        prod_existing = None
+    try:
+        segments_existing = pd.read_csv("../input/well_modelling/segments_geometry.csv", low_memory=False)
+    except FileNotFoundError:
+        segments_existing = None
 
     ensure_columns(
         wellmap,
@@ -883,11 +933,15 @@ def main(processes: int | None = None):
     top_perf_m = top_perf.dropna(subset=["WELL_KEY"]).copy()
     completion_m = completion.dropna(subset=["WELL_KEY"]).copy()
 
+    diff_wells = find_prod_diff_wells(prod, prod_existing)
+    if not diff_wells:
+        print("\nNo differences detected between prod input and existing prod_with_bhp.csv.")
+
     wells_prod = set(prod_m["WELL_KEY"].unique())
     wells_traj = set(traj_m["WELL_KEY"].unique())
     wells_perf = set(top_perf_m["WELL_KEY"].unique())
     wells_comp = set(completion_m["WELL_KEY"].unique())
-    valid_wells = wells_prod & wells_traj & wells_perf & wells_comp
+    valid_wells = (wells_prod & wells_traj & wells_perf & wells_comp) & set(diff_wells)
 
     print("\n=== Well availability ===")
     print(f"prod wells      : {len(wells_prod)}")
@@ -896,13 +950,12 @@ def main(processes: int | None = None):
     print(f"completion wells: {len(wells_comp)}")
     print(f"valid wells     : {len(valid_wells)}")
 
-    if not valid_wells:
-        print("\nNo wells have sufficient data AFTER mapping.")
+    if diff_wells and not valid_wells:
+        print("\nNo wells have sufficient data AFTER mapping for the diff set.")
         print("Sample WELL_KEY from prod     :", _head_list(sorted(wells_prod), 10))
         print("Sample WELL_KEY from traj     :", _head_list(sorted(wells_traj), 10))
         print("Sample WELL_KEY from top_perf :", _head_list(sorted(wells_perf), 10))
         print("Sample WELL_KEY from completion:", _head_list(sorted(wells_comp), 10))
-        raise RuntimeError("No wells have sufficient data to compute BHP. Fix wellsnames.csv mapping coverage.")
 
     print("\n=== Building segments + computing BHP in parallel (per well) ===")
     completion_tubing = completion_m[completion_m["SYMBOL_NAME"].astype(str).str.strip().eq("Tubing")].copy()
@@ -923,7 +976,7 @@ def main(processes: int | None = None):
             continue
         tasks.append((wk, traj_w, top_perf_w, comp_w, prod_w))
 
-    if not tasks:
+    if not tasks and valid_wells:
         raise RuntimeError(
             "No wells remain after filtering for trajectory/top_perf/prod data. "
             "Check mapping coverage and that top_perf/prod contain rows for the same WELL_KEY."
@@ -932,13 +985,14 @@ def main(processes: int | None = None):
     segments_list = []
     prod_results = []
     skipped = []
-    with mp.Pool(processes=processes, initializer=_pool_initializer) as pool:
-        for wk, seg_w, prod_w_bhp, err in pool.imap_unordered(_process_well, tasks):
-            if err:
-                skipped.append((wk, err))
-            else:
-                segments_list.append(seg_w)
-                prod_results.append(prod_w_bhp)
+    if tasks:
+        with mp.Pool(processes=processes, initializer=_pool_initializer) as pool:
+            for wk, seg_w, prod_w_bhp, err in pool.imap_unordered(_process_well, tasks):
+                if err:
+                    skipped.append((wk, err))
+                else:
+                    segments_list.append(seg_w)
+                    prod_results.append(prod_w_bhp)
 
     if skipped:
         print("Skipped wells (sample up to 20):")
@@ -946,10 +1000,8 @@ def main(processes: int | None = None):
             print(f"  {wk}: {msg}")
 
     segments_list = [df for df in segments_list if not df.empty]
-    if not segments_list:
-        raise RuntimeError("All wells were skipped during processing. Check trajectory/perf/completion consistency.")
 
-    segments = pd.concat(segments_list, ignore_index=True)
+    segments = pd.concat(segments_list, ignore_index=True) if segments_list else pd.DataFrame()
     prod_calc = pd.concat(prod_results, ignore_index=True) if prod_results else pd.DataFrame(columns=list(prod_m.columns) + ["BHP_bar", "BHP_STATUS"])
     if not prod_calc.empty:
         prod_calc = (
@@ -959,18 +1011,37 @@ def main(processes: int | None = None):
         )
 
     prod_out = prod.copy()
-    prod_out = prod_out.merge(
-        prod_calc[["WELL", "DATE", "WELL_KEY", "BHP_bar", "BHP_STATUS"]],
-        on=["WELL", "DATE", "WELL_KEY"],
-        how="left",
-    )
+    if prod_existing is not None and not prod_existing.empty:
+        prod_existing["DATE"] = pd.to_datetime(prod_existing["DATE"], errors="coerce")
+        prod_out = prod_out.merge(
+            prod_existing[["WELL", "DATE", "WELL_KEY", "BHP_bar", "BHP_STATUS"]],
+            on=["WELL", "DATE", "WELL_KEY"],
+            how="left",
+        )
+    if not prod_calc.empty:
+        prod_out = prod_out.merge(
+            prod_calc[["WELL", "DATE", "WELL_KEY", "BHP_bar", "BHP_STATUS"]],
+            on=["WELL", "DATE", "WELL_KEY"],
+            how="left",
+            suffixes=("", "_new"),
+        )
+        for col in ["BHP_bar", "BHP_STATUS"]:
+            new_col = f"{col}_new"
+            if new_col in prod_out.columns:
+                prod_out[col] = prod_out[new_col].combine_first(prod_out[col])
+                prod_out.drop(columns=[new_col], inplace=True)
     prod_out["BHP_STATUS"] = prod_out["BHP_STATUS"].fillna("INSUFFICIENT_DATA")
 
-    segments.to_csv("../input/well_modelling/segments_geometry.csv", index=False)
-    prod_out.to_csv("../input/well_modelling/prod_with_bhp.csv",     index=False)
+    if not segments.empty:
+        if segments_existing is not None and not segments_existing.empty:
+            segments_existing = segments_existing[~segments_existing["WELL_KEY"].isin(diff_wells)]
+            segments = pd.concat([segments_existing, segments], ignore_index=True)
+        segments.to_csv("../input/well_modelling/segments_geometry.csv", index=False)
+        print("Wrote: segments_geometry.csv")
+
+    prod_out.to_csv("../input/well_modelling/prod_with_bhp.csv", index=False)
 
     print("\nDone.")
-    print("Wrote: segments_geometry.csv")
     print("Wrote: prod_with_bhp.csv")
 
 
