@@ -32,6 +32,12 @@ num_bins = 50                  # guide corridor stations
 min_cells_per_bin = 3
 structure_bias = 0.15          # 0=top of guide, 1=bottom of guide
 
+# Anti-collision ellipsoid around the old well path
+anti_collision_factor = 1.0    # >1.0 increases clearance envelope
+collision_radius_xy = 80.0     # meters (X/Y semi-axis before factor)
+collision_radius_z = 30.0      # meters (Z semi-axis before factor)
+collision_buffer = 1.05        # enforce slightly outside the ellipsoid
+
 
 # -----------------------------
 # Geometry helpers
@@ -99,6 +105,41 @@ def direction_at_md(points_xyz: np.ndarray, md: np.ndarray, md_target: float) ->
     if i1 == i0:
         i1 = min(len(points_xyz) - 1, i0 + 1)
     return normalize(points_xyz[i1] - points_xyz[i0])
+
+
+def enforce_anti_collision(candidate: np.ndarray, old_path_xyz: np.ndarray) -> np.ndarray:
+    """
+    Push candidate point outside an ellipsoid around the nearest old-path point.
+
+    Ellipsoid condition (must be >= 1):
+        (dx/ax)^2 + (dy/ay)^2 + (dz/az)^2 >= 1
+    where ax=ay=collision_radius_xy*anti_collision_factor
+          az=collision_radius_z*anti_collision_factor
+    """
+    ax = max(1e-6, collision_radius_xy * anti_collision_factor)
+    ay = max(1e-6, collision_radius_xy * anti_collision_factor)
+    az = max(1e-6, collision_radius_z * anti_collision_factor)
+
+    diffs = candidate[None, :] - old_path_xyz
+    scaled = np.column_stack((diffs[:, 0] / ax, diffs[:, 1] / ay, diffs[:, 2] / az))
+    score = np.sum(scaled * scaled, axis=1)
+
+    idx = int(np.argmin(score))
+    nearest = old_path_xyz[idx]
+    d = candidate - nearest
+    s = np.array([d[0] / ax, d[1] / ay, d[2] / az], dtype=float)
+    r = float(np.linalg.norm(s))
+
+    if r >= 1.0:
+        return candidate
+
+    if r < 1e-10:
+        s = np.array([1.0, 0.0, 0.0], dtype=float)
+        r = 1.0
+
+    s_boundary = (s / r) * collision_buffer
+    corrected = nearest + np.array([s_boundary[0] * ax, s_boundary[1] * ay, s_boundary[2] * az])
+    return corrected
 
 
 # -----------------------------
@@ -212,10 +253,20 @@ def plan_sidetrack(existing_xyz: np.ndarray, control_points: np.ndarray, major_a
             break
 
         new_dir = rotate_towards(current_dir, desired, max_turn_deg)
-        current = current + step_length * new_dir
+        candidate = current + step_length * new_dir
+
+        # Keep the sidetrack away from old wellpath after KOP using ellipsoidal clearance.
+        # Iterate a few times because correcting against one nearest point can expose another.
+        for _ in range(3):
+            corrected = enforce_anti_collision(candidate, existing_xyz)
+            if np.allclose(corrected, candidate):
+                break
+            candidate = corrected
+
+        current = candidate
 
         sidetrack.append(current.copy())
-        current_dir = new_dir
+        current_dir = normalize(current - sidetrack[-2])
 
         if look_ahead_idx >= len(forward_cp) - 1 and np.linalg.norm(current - forward_cp[-1]) < 2.0 * step_length:
             break
@@ -248,3 +299,9 @@ with open(output_path, "w") as f:
 
 print("Sidetrack exported:", output_path)
 print(f"Structure bias used: {structure_bias:.2f} (0=top, 1=bottom of guide window)")
+print(
+    "Anti-collision ellipsoid:",
+    f"XY={collision_radius_xy * anti_collision_factor:.1f} m,",
+    f"Z={collision_radius_z * anti_collision_factor:.1f} m,",
+    f"buffer={collision_buffer:.2f}",
+)
